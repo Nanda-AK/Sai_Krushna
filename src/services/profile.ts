@@ -1,0 +1,93 @@
+import { z } from "zod";
+import { supabase } from "@/lib/supabase";
+import type { Profile } from "@/types/profile";
+
+export const ProfileSchema = z.object({
+  id: z.string(),
+  full_name: z.string().min(2),
+  age: z.number().min(5).max(120),
+  gender: z.enum(["male", "female", "other"]),
+  standard: z.string().min(1),
+  role: z.enum(["student","parent","teacher","principal"]).optional(),
+});
+
+export type ProfileInput = Omit<Profile, "created_at" | "updated_at">;
+
+const localKey = (id: string) => `profile:${id}`;
+
+export async function getProfile(userId: string): Promise<Profile | null> {
+  try {
+    const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      const local = localStorage.getItem(localKey(userId));
+      return local ? (JSON.parse(local) as Profile) : null;
+    }
+    return data as Profile;
+  } catch (_e) {
+    // Fallback to local
+    const local = localStorage.getItem(localKey(userId));
+    return local ? (JSON.parse(local) as Profile) : null;
+  }
+}
+
+export async function upsertProfile(input: ProfileInput): Promise<{ ok: boolean; error?: string }> {
+  // Persist locally first for resilience
+  try { localStorage.setItem(localKey(input.id), JSON.stringify(input)); } catch {}
+
+  try {
+    const parsed = ProfileSchema.parse(input as any);
+    const { error } = await supabase.from("profiles").upsert({ ...parsed, updated_at: new Date().toISOString() });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? "Failed to save profile" };
+  }
+}
+
+export function needsOnboarding(p?: Profile | null): boolean {
+  if (!p) return true;
+  return !p.full_name || !p.age || !p.gender || !p.standard;
+}
+
+// Batch fetch minimal profile info (id, full_name) and return a map id -> displayName.
+// Used by teachers to show student names without ever displaying emails.
+export async function getProfilesByIds(ids: string[]): Promise<Record<string, string>> {
+  if (!ids || ids.length === 0) return {};
+  try {
+    const uniq = Array.from(new Set(ids.filter(Boolean)));
+    if (uniq.length === 0) return {};
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, full_name")
+      .in("id", uniq);
+    if (error || !data) return {};
+    const map: Record<string, string> = {};
+    for (const row of data as Array<{ id: string; full_name: string }>) {
+      map[row.id] = row.full_name || "Player";
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
+// Secure RPC: for teachers to fetch a student's limited profile (no emails) only if
+// the student has runs on tasks created by the current teacher. Avoids RLS recursion.
+export async function getStudentProfileForTeacher(studentId: string): Promise<Profile | null> {
+  try {
+    const { data, error } = await supabase.rpc('get_student_profile_for_teacher', { student_id: studentId });
+    if (error || !data) return null;
+    const row = Array.isArray(data) ? (data[0] as any) : (data as any);
+    if (!row) return null;
+    return {
+      id: row.id,
+      full_name: row.full_name,
+      age: row.age,
+      gender: row.gender,
+      standard: row.standard,
+    } as Profile;
+  } catch {
+    return null;
+  }
+}
